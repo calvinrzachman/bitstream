@@ -62,6 +62,7 @@ import (
 	sendLoop() and recvLoop(), gRPC streams and Watch_WatchServer
 
 	Learn about gRPC and Protocol Buffers (start with justForFunc)
+	Learn about WebSockets
 
 	Other Links:
 	- https://medium.com/@nate510/don-t-use-go-s-default-http-client-4804cb19f779
@@ -77,8 +78,6 @@ var (
 	pauseTimeout  time.Duration = 5 * time.Second
 )
 
-const demoPaymentID string = "1"
-
 func main() {
 	// METHOD 1: HTTP Protocol
 	log.Println("Ready to serve...")
@@ -90,6 +89,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
+
+	// METHOD 3: WebSockets (HTTP falls back to raw TCP connection and keeps it open)
 
 	// Start the PaymentProcessor routine which will gather information on lightning network (LN)
 	// payments from the LN backend and communicates what it finds to the individual request handlers
