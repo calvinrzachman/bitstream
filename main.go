@@ -1,14 +1,11 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
-	"net/http"
-	"sync"
 	"time"
 )
 
@@ -76,6 +73,8 @@ import (
 var (
 	paymentWindow time.Duration = 10 * time.Second
 	pauseTimeout  time.Duration = 5 * time.Second
+	pollInterval  time.Duration = 500 * time.Millisecond // Wait time between successful polls of LND backend for given client
+	// Do we need a poll interval?
 )
 
 func main() {
@@ -94,7 +93,9 @@ func main() {
 
 	// Start the PaymentProcessor routine which will gather information on lightning network (LN)
 	// payments from the LN backend and communicates what it finds to the individual request handlers
-	payments := &PaymentProcessor{Notifiers: map[string]*Subscriber{}}
+	// Create our input and output channels.
+	pending, complete := make(chan *Subscriber), make(chan *Subscriber)
+	payments := &PaymentProcessor{Notifiers: map[string]*Subscriber{}, Pending: pending, Complete: complete}
 	go payments.Process()
 
 	for { // Serve connections continuously for the lifetime of the server
@@ -104,15 +105,15 @@ func main() {
 		}
 
 		// Service the connection - generally: go serviceConn(conn)
-		go streamRandomBytes(conn, payments)
+		go streamRandomBytes(conn, payments, pending)
 		// NOTE: Do not block anywhere else in this loop
 	}
 }
 
 // streamRandomBytes reimplements 'handler' using the net package directly
 // in an attempt to create an actual stream of bytes to the client
-func streamRandomBytes(conn net.Conn, paymentProcessor *PaymentProcessor) {
-	log.Printf("Streaming random bytes for client: %s ...", conn.RemoteAddr().String())
+func streamRandomBytes(conn net.Conn, paymentProcessor *PaymentProcessor, register chan<- *Subscriber) {
+	log.Printf("[%s - handler routine]: Streaming random bytes...", conn.RemoteAddr().String())
 	defer conn.Close() // IMPORTANT: Connections must be closed otherwise they will hang around in CLOSE_WAIT
 
 	lightningChannel := make(chan *LightningPayment)
@@ -120,27 +121,27 @@ func streamRandomBytes(conn net.Conn, paymentProcessor *PaymentProcessor) {
 
 	// Register with the PaymentProcessor
 	requestID := conn.RemoteAddr().String()
-	paymentProcessor.Register(requestID, lightningChannel) // receive updates on payments for this client
+	paymentProcessor.Register(requestID, lightningChannel, register) // receive updates on payments for this client
+	defer log.Printf("[%s - handler routine]: Finished handling requests for this client!", requestID)
 
 Stream:
 	for {
 		// log.Println(("Another stream cycle!"))
 		select {
 		case lastPayment, _ = <-lightningChannel:
-			log.Println("Payment received! Client ID: ", requestID)
+			log.Printf("[%s - handler routine]: Payment received!", requestID)
 		// TODO: Context/Cancellation case
 		default: // A default case allows for a non-blocking channel read
 			// log.Println("No payment received. Hopefully we get one soon!")
 		}
 
 		if time.Since(lastPayment.Received) > paymentWindow {
-			log.Printf("Failed to receive payment from %s in last %s. Holding stream while awaiting payment...", requestID, paymentWindow.String())
+			log.Printf("[%s - handler routine]: Failed to receive payment in last %s. Holding stream while awaiting payment...", requestID, paymentWindow.String())
 			select { // Pause/Resume mechanism
 			case lastPayment, _ = <-lightningChannel: // Resume the stream upon receipt of payment
-				log.Println("Payment received! Resuming stream for Client ID: ", requestID)
+				log.Printf("[%s - handler routine]: Payment received! Resuming stream", requestID)
 			case <-time.After(pauseTimeout):
-				log.Println("Ending stream. Did not receive payment within timeout.")
-				paymentProcessor.Unregister(requestID)
+				log.Printf("[%s - handler routine]: Ending stream. Did not receive payment within timeout.", requestID)
 				// ctx.Done()
 				break Stream // Discontinue streaming random bytes - return or break and sleep for some period of time.
 			}
@@ -200,22 +201,22 @@ type LightningPayment struct {
 
 // Subscriber represents a handler go routine registered to recieve payment updates
 type Subscriber struct {
-	ID       string
-	Notifier chan *LightningPayment
+	ID         string
+	Notifier   chan *LightningPayment
+	Registered bool
 }
 
 // PaymentProcessor gathers and handles payments from a Lightning Network backend on behalf of the server
 type PaymentProcessor struct {
-	Payments    []*LightningPayment
-	Subscribers []*Subscriber // A subscriber carries its own notifier channel (Do we need both this and the next thing?)
-	// Notifiers   map[string]chan *LightningPayment // Map from client ID to payment notifier channel
+	Pending   chan *Subscriber
+	Complete  chan *Subscriber
 	Notifiers map[string]*Subscriber // NOTE: vanilla maps are not safe for current use. Are we accessing this concurrently? I dont think so
 	Backend   *net.Conn
 }
 
 // Fetch obtains payments from Lightning Network backend
-func (p PaymentProcessor) Fetch(backend *net.Conn, id string) ([]*LightningPayment, error) {
-	log.Printf("Fetching payments from lnd for client ID: %s ...", id)
+func (s Subscriber) Fetch() ([]*LightningPayment, error) {
+	log.Printf("[%s - Fetch]: Fetching payments from lnd...", s.ID)
 	var payments []*LightningPayment
 
 	// Use a lnd RPC client to make a request for payments to local running instance of lnd
@@ -225,8 +226,10 @@ func (p PaymentProcessor) Fetch(backend *net.Conn, id string) ([]*LightningPayme
 	n := rand.Intn(10)
 	time.Sleep(time.Duration(n) * time.Second) // Sometimes it takes longer than others
 	if n < 8 {
-		log.Printf("Successfully received payment for client ID: %s ...", id)
-		payments = append(payments, &LightningPayment{ID: id, Received: time.Now()})
+		log.Printf("[%s - Fetch]: Successfully received payment! Sending to client handler... %d", s.ID, n)
+		payments = append(payments, &LightningPayment{ID: s.ID, Received: time.Now()})
+	} else {
+		log.Printf("[%s - Fetch]: Failed to received payment :( ... %d", s.ID, n)
 	}
 
 	return payments, nil
@@ -235,171 +238,70 @@ func (p PaymentProcessor) Fetch(backend *net.Conn, id string) ([]*LightningPayme
 // POSSIBLE REDESIGN: Should the Processor fetch all new payments from lnd and then process locally OR should it reach out to lnd
 // on behalf of each client handler specifically? If change, dont iterate over subscribers below
 
-// Process fetches lightning payments from the Lightning Network backend (LND) and
-// notifies the various client request handlers when payments have been received
+// Process uses channels to construct control loop for payment processing.
+// By the proverbial "sharing by communicating", we fetch lightning payments from the Lightning Network backend (LND)
+// asynchronously and notify the various client request handlers when payments have been received
 // NOTE(It would be cool if this could be implemented with a watch of the DB like controllers in K8s)
 func (p *PaymentProcessor) Process() {
-	for {
-		log.Println("Processing lightning payments ...")
-		if len(p.Subscribers) == 0 {
-			log.Println("No subscribers to monitor payments for!")
-			time.Sleep(4 * time.Second)
-			continue
+	log.Println("[Payment Processor routine]: Awaiting subscribers to process!")
+	defer log.Println("[Payment Processor routine]: Completed all Processing!")
+
+	// Check with lnd to see if we have recieved payment for a given client asynchronously.
+	// NOTE: Each call to Register() adds data to the processing queue so this can only create
+	// as many go routines as there are subscribers to the Payment Processor.
+	go func() {
+		for sub := range p.Pending {
+			// Sends subscribers that have finished processing to 'Completed' workload channel
+			go sub.Process(p.Complete)
 		}
+	}()
 
-		for _, sub := range p.Subscribers {
-			// Check with lnd to see if we have recieved payment for a given client
-			payments, _ := p.Fetch(p.Backend, sub.ID) // NOTE: This code is currently blocking
-			// backendChannel := make(chan *LightningPayment)
-			// go p.Fetch(p.Backend, sub.ID, backendChannel)
-
-			// If payment has been received, send to the appropriate channel
-			for _, payment := range payments {
-				log.Printf("Sending payment for client ID: %s", payment.ID)
-				// select {
-				// case <-time.After(2 * time.Second):
-				// case p.Notifiers[payment.ID].Notifier <- payment:
-				// }
-				// go func(payment *LightningPayment) {
-				// 	log.Println("[Sender Goroutine]: Sending Payment")
-				p.Notifiers[payment.ID].Notifier <- payment // What happens if this blocks? The channel is individual to the handler routine
-				// If it blocks here, the whole Payment Processor is blocked. If it blocks in a go routine then it will sit there forever unless given a way to be cancelled
-				// NOTE: The above is not safe and can lead to a nil pointer dereference in the event where the subscriber
-				// 	log.Println("[Sender Goroutine]: Payment Sent!")
-				// }(payment)
-			}
-		}
-
-		time.Sleep(2 * time.Second)
+	// Receive subscribers and return them to the queue of workload for next round of processing
+	for sub := range p.Complete {
+		go sub.Sleep(p.Pending)
 	}
 }
 
-// NOTE: Could even consider this a "Monitor" routine and continuously monitor lnd for payments
+// Process fetches lightning payments from the Lightning Network backend (LND) asynchronously
+// and notifies the various client request handlers when payments have been received
+func (s *Subscriber) Process(out chan<- *Subscriber) {
+	defer log.Printf("[%s - processor go routine]: Shutting down", s.ID)
+
+	if !s.Registered { // Remove the subscriber from processing
+		log.Printf("[%s - processor go routine]: Client is no longer registered", s.ID)
+		return
+	}
+
+	payments, _ := s.Fetch()
+	for _, payment := range payments {
+		select {
+		case s.Notifier <- payment: // If the client handler has shut down this will block until the timeout (below) removes the subscriber from rotation
+			log.Printf("[%s - processor go routine]: Sending payment to client handler!", s.ID)
+		case <-time.After(10 * time.Second): // Ensure go routine does not block awaiting channel write forever (Could this remove sub from rotation when we still want to poll?)
+			log.Printf("[%s - processor go routine]: Unable to send payment to client handler - blocked for 10s!", s.ID)
+			return
+		}
+	}
+	out <- s // Processing of this subscriber is complete - return to processing queue
+}
+
+// Sleep sleeps for a specified interval before sending
+// the Subscriber back to the processing channel for continued polling.
+func (s *Subscriber) Sleep(done chan<- *Subscriber) {
+	log.Printf("[%s - Sleep]: Waiting pollInterval seconds before returning client to input queue", s.ID)
+	time.Sleep(pollInterval)
+	done <- s
+}
+
+// NOTE: Could even consider this a "Monitor" routine and continuously monitor lnd for payments (THIS MIGHT BE IMPORTANT - we may need to share by communicating)
 // NOTE: The Process() function above is currently plagued by the fact that writes to the handler channels are blocking. Figure out how to
 // unblock these writes non-block writes (tho this might risk not notifying the handler), a "Monitor", or maybe just removing the processor.
-// In addition, it is synchronous. This has the effect that fetching payments and notifying one request handler comes at the expense of another
 
 // Register a client request handler with the PaymentProcessor
-func (p *PaymentProcessor) Register(id string, lightningChannel chan *LightningPayment) {
-	log.Println("Registering client ID: ", id)
-	s := &Subscriber{ID: id, Notifier: lightningChannel}
+func (p *PaymentProcessor) Register(id string, lightningChannel chan *LightningPayment, in chan<- *Subscriber) {
+	log.Println("[Payment Processor]: Registering client ID: ", id)
+	s := &Subscriber{ID: id, Notifier: lightningChannel, Registered: true}
 
-	// Add to list of subscribers
-	p.Subscribers = append(p.Subscribers, s)
-	log.Println("Subscribers: ", p.Subscribers, len(p.Subscribers))
-
-	// Add subscriber to ID map
-	p.Notifiers[id] = s
+	// Send subscriber to Payment Processor queue
+	in <- s
 }
-
-// Unregister removes a client request handler from the PaymentProcessor
-func (p *PaymentProcessor) Unregister(id string) error {
-	// Find the index of the subscriber in the array
-	var index int = -1
-	for i, sub := range p.Subscribers {
-		if id == sub.ID {
-			index = i
-		}
-	}
-
-	if index == -1 {
-		return errors.New("This id is not registered with Payment Processor")
-	}
-
-	s := p.Subscribers
-	s[len(s)-1], s[index] = s[index], s[len(s)-1]
-	s = s[:len(s)-1]
-	p.Subscribers = s
-	// p.Notifiers[id] = nil // Is this safe?
-	return nil
-}
-
-// CrunchNumbers creates a go routine that generates random bytes and writes them to a writer
-func CrunchNumbers(w http.ResponseWriter, wg *sync.WaitGroup) chan []byte {
-	c := make(chan []byte)
-	go func(w http.ResponseWriter) {
-		defer wg.Done()
-		defer close(c)
-		for i := 0; i < 5; i++ {
-			c <- WriteRandomBytes(w, 1) // Generate random bytes and write to channel
-			time.Sleep(250 * time.Millisecond)
-		}
-	}(w)
-	return c // Return channel to main go routine so it can read from it for logging
-
-}
-
-func handler(w http.ResponseWriter, r *http.Request) {
-	// ctx := r.Context()
-
-	log.Println("Handler Started...") // Try using a decorator instead
-	defer log.Println("Handler Ended")
-
-	var wg sync.WaitGroup
-	wg.Add(1)
-
-	// Number Cruncher GoRoutine
-	c := CrunchNumbers(w, &wg)
-	// c := func(w http.ResponseWriter) chan []byte { // Alternate method: inline function
-	// 	c := make(chan []byte)
-	// 	go func() {
-	// 		defer wg.Done()
-	// 		defer close(c)
-	// 		for i := 0; i < 5; i++ {
-	// 			c <- WriteRandomBytes(w, 1) // Generate random bytes and write to channel
-	// 		}
-	// 	}()
-	// 	return c // Return channel to main go routine so it can read from it for logging
-	// }(w)
-
-	// Read from the channel
-	// var item []byte
-	// var ok bool
-	for item := range c {
-		log.Println("Wrote to socket", item)
-	}
-	// OuterLoop: // Alternative method: for/select
-	// 	for {
-	// 		select {
-	// 		case item, ok = <-c:
-	// 			if !ok {
-	// 				log.Println("Channel has closed!") // There is nothing left to read from the channel (does this make the next case redundant?)
-	// 				break OuterLoop
-	// 			}
-	// 			log.Println("Wrote to socket", item)
-	// 			// c = nil - reads from nil channels block forever
-	// 		case <-time.After(5 * time.Second):
-	// 			// fmt.Fprintln(w, "I have mercy!")
-	// 			log.Println("I have mercy!")
-	// 			break OuterLoop
-	// 			// default:
-	// 			// 	time.Sleep(1 * time.Second)
-	// 			// 	log.Println("Nothing to process...")
-	// 			// case <-ctx.Done():
-	// 			// 	err := ctx.Err()
-	// 			// 	log.Println(err.Error())
-	// 			// 	break
-	// 			// http.Error(w, err.Error(), http.StatusInternalServerError)
-	// 		}
-	// 	}
-
-	wg.Wait()
-}
-
-// close(lightningChannel) // Close channel so PaymentProcessor knows he can wrap up - WRONG writes to a closed channel panic. Need another way
-// case <-ctx.Done(): // TODO: Context/Cancellation case
-// 	err := ctx.Err()
-// 	log.Println(err.Error())
-// 	break PaymentProcessor/Streamer
-
-// lightningChannel := make(chan *LightningPayment)
-// select {
-// case lastPayment := <-lightningChannel:
-// 	// lastPayment := getLastPayment()
-// 	if time.Since(lastPayment.Received) > 10*time.Second {
-// 		log.Println("Where is my money at?")
-// 	}
-
-// default:
-// 	WriteRandomBytes(conn, 1)
-// }
