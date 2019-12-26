@@ -73,9 +73,15 @@ import (
 var (
 	paymentWindow time.Duration = 10 * time.Second
 	pauseTimeout  time.Duration = 5 * time.Second
-	pollInterval  time.Duration = 500 * time.Millisecond // Wait time between successful polls of LND backend for given client
+	pollInterval  time.Duration = 1 * time.Second // Wait time between successful polls of LND backend for given client
 	// Do we need a poll interval?
+	payments PaymentProcessor
 )
+
+func init() {
+	pending, complete := make(chan *Subscriber), make(chan *Subscriber)
+	payments = PaymentProcessor{Notifiers: map[string]*Subscriber{}, Pending: pending, Complete: complete}
+}
 
 func main() {
 	// METHOD 1: HTTP Protocol
@@ -93,9 +99,6 @@ func main() {
 
 	// Start the PaymentProcessor routine which will gather information on lightning network (LN)
 	// payments from the LN backend and communicates what it finds to the individual request handlers
-	// Create our input and output channels.
-	pending, complete := make(chan *Subscriber), make(chan *Subscriber)
-	payments := &PaymentProcessor{Notifiers: map[string]*Subscriber{}, Pending: pending, Complete: complete}
 	go payments.Process()
 
 	for { // Serve connections continuously for the lifetime of the server
@@ -105,14 +108,14 @@ func main() {
 		}
 
 		// Service the connection - generally: go serviceConn(conn)
-		go streamRandomBytes(conn, payments, pending)
+		go streamRandomBytes(conn)
 		// NOTE: Do not block anywhere else in this loop
 	}
 }
 
 // streamRandomBytes reimplements 'handler' using the net package directly
 // in an attempt to create an actual stream of bytes to the client
-func streamRandomBytes(conn net.Conn, paymentProcessor *PaymentProcessor, register chan<- *Subscriber) {
+func streamRandomBytes(conn net.Conn) {
 	log.Printf("[%s - handler routine]: Streaming random bytes...", conn.RemoteAddr().String())
 	defer conn.Close() // IMPORTANT: Connections must be closed otherwise they will hang around in CLOSE_WAIT
 
@@ -121,7 +124,7 @@ func streamRandomBytes(conn net.Conn, paymentProcessor *PaymentProcessor, regist
 
 	// Register with the PaymentProcessor
 	requestID := conn.RemoteAddr().String()
-	paymentProcessor.Register(requestID, lightningChannel, register) // receive updates on payments for this client
+	payments.Register(requestID, lightningChannel) // receive updates on payments for this client
 	defer log.Printf("[%s - handler routine]: Finished handling requests for this client!", requestID)
 
 Stream:
@@ -263,8 +266,9 @@ func (p *PaymentProcessor) Process() {
 }
 
 // Process fetches lightning payments from the Lightning Network backend (LND) asynchronously
-// and notifies the various client request handlers when payments have been received
-func (s *Subscriber) Process(out chan<- *Subscriber) {
+// and notifies the various client request handlers when payments have been received, sending
+// the subscriber to 'done' channel to prepare for next round of processing
+func (s *Subscriber) Process(done chan<- *Subscriber) {
 	defer log.Printf("[%s - processor go routine]: Shutting down", s.ID)
 
 	if !s.Registered { // Remove the subscriber from processing
@@ -282,7 +286,7 @@ func (s *Subscriber) Process(out chan<- *Subscriber) {
 			return
 		}
 	}
-	out <- s // Processing of this subscriber is complete - return to processing queue
+	done <- s // Processing of this subscriber is complete - return to processing queue
 }
 
 // Sleep sleeps for a specified interval before sending
@@ -298,10 +302,10 @@ func (s *Subscriber) Sleep(done chan<- *Subscriber) {
 // unblock these writes non-block writes (tho this might risk not notifying the handler), a "Monitor", or maybe just removing the processor.
 
 // Register a client request handler with the PaymentProcessor
-func (p *PaymentProcessor) Register(id string, lightningChannel chan *LightningPayment, in chan<- *Subscriber) {
+func (p *PaymentProcessor) Register(id string, lightningChannel chan *LightningPayment) {
 	log.Println("[Payment Processor]: Registering client ID: ", id)
 	s := &Subscriber{ID: id, Notifier: lightningChannel, Registered: true}
 
 	// Send subscriber to Payment Processor queue
-	in <- s
+	p.Pending <- s
 }
