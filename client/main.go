@@ -66,12 +66,34 @@ func streamRandomData(conn net.Conn) {
 // 	return time.Now()
 // }
 
+// // LightningInvoice is the Bitstream client's
+// // representation of Lighning Network invoices
+// type LightningInvoice struct {
+// 	invoice lnrpc.Invoice
+// }
+
+// // InvoiceStreamer is a gRPC client stream which receives
+// // a stream on Lightning Network payment invoices from the Bitsream server
+// type InvoiceStreamer struct {
+// 	Invoices grpc.ClientStream
+// }
+
 // func streamPayment() {
 // 	continueStream := make(chan bool)
-// SendPayment RPC https://github.com/lightningnetwork/lnd/tree/master/lnrpc
+// 	// SendPayment RPC https://github.com/lightningnetwork/lnd/tree/master/lnrpc
 
+// 	// Stream invoices from Bitstream server
+// 	var invoice LightningInvoice
+// 	go func() {
+// 		for {
+// 			// invoice, err := grpc.blah blah blah.Recv(&invoice)
+// 		}
+// 	}()
+
+// 	// Send Lightning network payment to Bitstream server
+
+// 	// Stream payment to Bitstream server
 // 	for {
-// 		// Send Lightning network payment to Bitstream server
 
 // 		select {
 // 		case <-continueStream:
