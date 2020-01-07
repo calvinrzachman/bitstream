@@ -11,8 +11,6 @@ import (
 	"path"
 	"time"
 
-	// "code.internal/stream"
-
 	"projects/bitstream/rpc"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
@@ -142,7 +140,7 @@ func main() {
 	// NOTE: LND -> Bitstream already uses gRPC
 
 	// Start the PaymentProcessor routine which will gather information on lightning network (LN)
-	// payments from the LN backend and communicates what it finds to the individual request handlers
+	// payments from the LN backend and communicate what it finds to the individual request handlers
 	go payments.Process()
 
 	for { // Serve connections continuously for the lifetime of the server
@@ -157,11 +155,10 @@ func main() {
 	}
 }
 
-// streamRandomBytes reimplements 'handler' using the net package directly
-// in an attempt to create an actual stream of bytes to the client
+// streamRandomBytes streams random bytes to the Bitstream client
 func streamRandomBytes(conn net.Conn) {
 	log.Printf("[%s - handler routine]: Streaming random bytes...", conn.RemoteAddr().String())
-	defer conn.Close() // IMPORTANT: Connections must be closed otherwise they will hang around in CLOSE_WAIT
+	defer conn.Close()
 
 	lightningChannel := make(chan *LightningPayment)
 	lastPayment := &LightningPayment{Received: time.Now()}
@@ -173,7 +170,6 @@ func streamRandomBytes(conn net.Conn) {
 
 Stream:
 	for {
-		// log.Println(("Another stream cycle!"))
 		select {
 		case lastPayment, _ = <-lightningChannel:
 			log.Printf("[%s - handler routine]: Payment received!", requestID)
@@ -185,12 +181,11 @@ Stream:
 		if time.Since(lastPayment.Received) > paymentWindow {
 			log.Printf("[%s - handler routine]: Failed to receive payment in last %s. Holding stream while awaiting payment...", requestID, paymentWindow.String())
 			select { // Pause/Resume mechanism
-			case lastPayment, _ = <-lightningChannel: // Resume the stream upon receipt of payment
+			case lastPayment, _ = <-lightningChannel:
 				log.Printf("[%s - handler routine]: Payment received! Resuming stream", requestID)
 			case <-time.After(pauseTimeout):
 				log.Printf("[%s - handler routine]: Ending stream. Did not receive payment within timeout.", requestID)
-				// ctx.Done()
-				break Stream // Discontinue streaming random bytes - return or break and sleep for some period of time.
+				break Stream
 			}
 		}
 
@@ -205,11 +200,6 @@ Stream:
 
 /*
 	IDEA: Separate loop which writes random bytes and the loop which checks for payment.
-	Create a Watcher loop which sits blocking in wait for either a timer to expire (paymentWindow) or a payment to come
-	through (reset this timer) and a Writer loop which continously writes bytes (rate limit if you want) unless it receives an interrupt
-	signal from the Watcher routine.
-
-	OR just go with the original way of time.Since(lastPayment.Received) > paymentWindow and a sleep in the loop body
 */
 
 // WriteRandomBytes writes n random bytes to a writer
@@ -262,7 +252,8 @@ type PaymentProcessor struct {
 	LightningClient lnrpc.LightningClient
 }
 
-// Process uses channels to construct control loop for payment processing.
+// Process starts Bitstream gRPC server for streaming payment requests to client.
+// Formerly used channels to construct control loop for payment processing.
 // By the proverbial "sharing by communicating", we fetch lightning payments from the Lightning Network backend (LND)
 // asynchronously and notify the various client request handlers when payments have been received
 // NOTE(It would be cool if this could be implemented with a watch of the DB like controllers in K8s)
@@ -280,7 +271,7 @@ func (p *PaymentProcessor) Process() {
 	} else {
 		log.Println("[Payment Processor routine]: listening on :8081")
 	}
-	srv.Serve(l) // gRPC server blocks here
+	srv.Serve(l)
 }
 
 // NOTE: It might be more efficient to have the Processor open long running go routines for each client
