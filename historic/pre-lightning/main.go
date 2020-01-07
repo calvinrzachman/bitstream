@@ -1,31 +1,17 @@
 package main
 
 import (
-	"context"
 	"fmt"
 	"io"
 	"log"
 	"math/rand"
 	"net"
-	"os/user"
-	"path"
 	"time"
-
-	// "code.internal/stream"
-
-	"projects/bitstream/rpc"
-
-	"github.com/lightningnetwork/lnd/lnrpc"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials"
 )
 
 /*
 	For notes on streaming with the HTTP protocol see: https://stackoverflow.com/questions/48267616/why-is-golang-http-responsewriter-execution-being-delayed
 	Without the help from the article above we would likely need to use the net package directly to continuously send data over a TCP connection (TRY THIS!)
-
-
 	TODO:
 	- Create a client which opens connection to the random server and streams data.
 	- Setup Lightning Network Functionality:
@@ -38,89 +24,50 @@ import (
 			2. Tit for Tat Method: Only send data upon reciept of (NOTE: this method will enforce an upper bound on stream speed - limiting the stream speed to the speed
 			of the Lightning network which, despite the name, is not as fast as TCP/HTTP as it requires multiple rounds of communication to negotiate the trustless transfer of
 			funds. For this reason we should shoot for the Window method and only do this if it is easier)
-
 			This will involve generating preimages and payment hashes (unless we try spontaneous payments - GOOD IDEA!)
 		- Similarly, setup the client to talk to its own Lightning node and generate payments with LND as it recieves data from the server.
 		The client will contact lnd to send a lightning payment to the server
 		The client will pay with good faith in the server, but will need to check that it continues to receive data.
-
 		What happens if the data/payment is a little late to arrive?
-
 		With the above we hope to acheive a (logical) bidirectional stream of data and money as pictured below:
-
 		                   data
 					  		-->
 					Server		 Client
 							<--
 						   crypto
-
 		A bidirectional stream of value
-
 	If both nodes are mine, anyone can demo and I wont lose any money (maybe a tiny amount). The client will need to be rebalanced eventually so perhaps we can send a
 	payment back to him every so often.
-
 	The server will have one PaymentProcessor routine which will gather information on lightning network (LN) payments from the LN backend and
 	send to the routine processing the user request (NOTE: This will be one payment processor to X handlers if a client makes X requests.
 	In the case of multiple clients, the PaymentProcessor will need to send the lightning payments to the correct handler for each client)
-
 	We could either have a case of every request handler reaching out to the LN backend on its own to get transactions which pertain to it
 	OR a proxy of types that is the sole interactor with the backend and communicates what it finds to the individual request handlers
-
 	NOTE: We should make use of the context package to clean up go routines because server resources will otherwise be wasted should connections close
 	NOTE: Method 1 (adapted HTTP) might be required for this to be used in a browser
 	Look at the etcd Watch API (Watcher RPCs) - https://github.com/etcd-io/etcd/blob/877aa2497e3fe1fea3c673bc8a84abb64619b8a6/etcdserver/api/v3rpc/watch.go
 	sendLoop() and recvLoop(), gRPC streams and Watch_WatchServer
-
 	Learn about gRPC and Protocol Buffers (start with justForFunc)
 	Learn about WebSockets
-
-	QUESTION: Should I multiplex client handler requests over same gRPC/TCP connection to lnd?
-	Or should each client handler open its own connection to lnd? Should we poll the lnd backend?
-
-	We now have a scenario where the Bitstream server wishes to stream both random bytes AND
-	Lightning Network invoices to the client. The client will pay to these invoices (Payment Stream)
-
-	Learn about Spontaneous payments
-
-	IMPORTANT: After integrating Lightning Network functionality the server will no longer run
-	on computers without the proper LND setup. Either containerize/script LN Dev setup so that
-	Bitstream can run as a standalone or enable the server to plugin to nodes running on machines
-	more generally
-
-	IMPORTANT: Look into differences between SendPayment and SendPaymentSync RPC
-
-	ALTERNATIVE METHOD: From main create and run go BitstreamServer() and treat this as
-	new main go routine for each client connection, inside which we run go streamRandomBytes and stream
-	payment requests. This might simplify the code.
-
 	Other Links:
 	- https://medium.com/@nate510/don-t-use-go-s-default-http-client-4804cb19f779
 	- https://medium.com/statuscode/how-i-write-go-http-services-after-seven-years-37c208122831
-
 	- https://stackoverflow.com/questions/11104085/in-go-does-a-break-statement-break-from-a-switch-select
 	- https://stackoverflow.com/questions/35445630/how-does-this-for-loop-break-when-select-is-done
 	- https://stackoverflow.com/questions/21783333/how-to-break-out-of-select-gracefuly-in-golang
 */
 
 var (
-	byteStreamDelay time.Duration = 100 * time.Millisecond
-	paymentWindow   time.Duration = 10 * time.Second
-	pauseTimeout    time.Duration = 5 * time.Second
-	lndPollInterval time.Duration = 2 * time.Second // Wait time between successful polls of LND backend for given client
+	paymentWindow time.Duration = 10 * time.Second
+	pauseTimeout  time.Duration = 5 * time.Second
+	pollInterval  time.Duration = 1 * time.Second // Wait time between successful polls of LND backend for given client
 	// Do we need a poll interval?
 	payments PaymentProcessor
 )
 
 func init() {
-	// Initialize the Payment Processor
-	payments = PaymentProcessor{
-		Notifiers: map[string]*Subscriber{},
-	}
-
-	err := payments.EnableLightning()
-	if err != nil {
-		log.Fatalf("[PaymentProcessor init]: failed to setup payment processor - %v", err)
-	}
+	pending, complete := make(chan *Subscriber), make(chan *Subscriber)
+	payments = PaymentProcessor{Notifiers: map[string]*Subscriber{}, Pending: pending, Complete: complete}
 }
 
 func main() {
@@ -130,16 +77,12 @@ func main() {
 	// http.ListenAndServe("127.0.0.1:8080", nil)
 
 	// METHOD 2: Layer 4 - Direct TCP
-	l, err := net.Listen("tcp", ":8080")
+	l, err := net.Listen("tcp", "localhost:8080")
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	// METHOD 3: WebSockets (HTTP falls back to raw TCP connection and keeps it open)
-	// METHOD 4: gRPC (Create a unidirectional stream of data server -> client)
-	// Since we're looking to stream both random bytes AND invoices this might be whats needed
-
-	// NOTE: LND -> Bitstream already uses gRPC
 
 	// Start the PaymentProcessor routine which will gather information on lightning network (LN)
 	// payments from the LN backend and communicates what it finds to the individual request handlers
@@ -195,7 +138,7 @@ Stream:
 		}
 
 		WriteRandomBytes(conn, 1)
-		time.Sleep(byteStreamDelay)
+		time.Sleep(250 * time.Millisecond)
 	}
 }
 
@@ -208,7 +151,6 @@ Stream:
 	Create a Watcher loop which sits blocking in wait for either a timer to expire (paymentWindow) or a payment to come
 	through (reset this timer) and a Writer loop which continously writes bytes (rate limit if you want) unless it receives an interrupt
 	signal from the Watcher routine.
-
 	OR just go with the original way of time.Since(lastPayment.Received) > paymentWindow and a sleep in the loop body
 */
 
@@ -235,15 +177,12 @@ func GenerateRandomBytes(n int) ([]byte, error) {
 }
 
 /*
-
 	LIGHTNING NETWORK
-
 */
 
 // LightningPayment represents a Bitcoin payment received over the lightning network
 type LightningPayment struct {
-	ID string
-	*lnrpc.Invoice
+	ID       string
 	Received time.Time
 }
 
@@ -252,15 +191,39 @@ type Subscriber struct {
 	ID         string
 	Notifier   chan *LightningPayment
 	Registered bool
-	// PaymentRequestServer rpc.Payments_StreamPaymentRequestsServer
 }
 
-// PaymentProcessor gathers and handles payments from a Lightning Network
-// backend on behalf of the Bitstream server
+// PaymentProcessor gathers and handles payments from a Lightning Network backend on behalf of the server
 type PaymentProcessor struct {
-	Notifiers       map[string]*Subscriber // NOTE: vanilla maps are not safe for current use.
-	LightningClient lnrpc.LightningClient
+	Pending   chan *Subscriber
+	Complete  chan *Subscriber
+	Notifiers map[string]*Subscriber // NOTE: vanilla maps are not safe for current use. Are we accessing this concurrently? I dont think so
+	Backend   *net.Conn
 }
+
+// Fetch obtains payments from Lightning Network backend
+func (s Subscriber) Fetch() ([]*LightningPayment, error) {
+	log.Printf("[%s - Fetch]: Fetching payments from lnd...", s.ID)
+	var payments []*LightningPayment
+
+	// Use a lnd RPC client to make a request for payments to local running instance of lnd
+
+	// Simulate fetching of payments
+	rand.Seed(time.Now().UnixNano())
+	n := rand.Intn(10)
+	time.Sleep(time.Duration(n) * time.Second) // Sometimes it takes longer than others
+	if n < 8 {
+		log.Printf("[%s - Fetch]: Successfully received payment! Sending to client handler... %d", s.ID, n)
+		payments = append(payments, &LightningPayment{ID: s.ID, Received: time.Now()})
+	} else {
+		log.Printf("[%s - Fetch]: Failed to received payment :( ... %d", s.ID, n)
+	}
+
+	return payments, nil
+}
+
+// POSSIBLE REDESIGN: Should the Processor fetch all new payments from lnd and then process locally OR should it reach out to lnd
+// on behalf of each client handler specifically? If change, dont iterate over subscribers below
 
 // Process uses channels to construct control loop for payment processing.
 // By the proverbial "sharing by communicating", we fetch lightning payments from the Lightning Network backend (LND)
@@ -270,167 +233,63 @@ func (p *PaymentProcessor) Process() {
 	log.Println("[Payment Processor routine]: Awaiting subscribers to process!")
 	defer log.Println("[Payment Processor routine]: Completed all Processing!")
 
-	// Setup gRPC Payment Request streaming server
-	srv := grpc.NewServer()
-
-	rpc.RegisterPaymentsServer(srv, p)
-	l, err := net.Listen("tcp", ":8081")
-	if err != nil {
-		log.Fatalf("[Payment Processor routine]: could not listen on :8081: %v", err)
-	} else {
-		log.Println("[Payment Processor routine]: listening on :8081")
-	}
-	srv.Serve(l) // gRPC server blocks here
-}
-
-// NOTE: It might be more efficient to have the Processor open long running go routines for each client
-// which poll lnd in a loop
-
-// AddInvoice creates a new invoice for the provided amount
-// TODO: propogate context from StreamPaymentRequests RPC
-func (p *PaymentProcessor) AddInvoice(amt int64, ID string) (*lnrpc.Invoice, error) {
-	log.Printf("[%s - Payment Processor AddInvoice]: Adding Invoice!", ID)
-	ctx := context.Background()
-
-	// Generate payment invoice
-	i := &lnrpc.Invoice{Value: amt}
-	addInvoiceResponse, err := p.LightningClient.AddInvoice(ctx, i)
-	if err != nil {
-		return nil, fmt.Errorf("unable to add invoice: %v", err)
-	}
-	log.Printf("[%s - Payment Processor AddInvoice]: Successfully created invoice: %x", ID, addInvoiceResponse.RHash[:6])
-
-	invoice := &lnrpc.Invoice{}
-	invoice.PaymentRequest = addInvoiceResponse.PaymentRequest
-	invoice.RHash = addInvoiceResponse.RHash
-	return invoice, nil
-}
-
-// VerifyInvoice verifies that an invoice has been settled
-func (p *PaymentProcessor) VerifyInvoice(hash *lnrpc.PaymentHash, ID string) (*lnrpc.Invoice, error) {
-	log.Printf("[%s - Payment Processor VerifyInvoice]: Verifying Invoice - %x", ID, hash.RHash[:6])
-	ctx := context.Background()
-
-	// Lookup invoice
-	invoice, err := p.LightningClient.LookupInvoice(ctx, &lnrpc.PaymentHash{RHash: hash.RHash})
-	if err != nil {
-		return nil, fmt.Errorf("unable to lookup invoice: %v", err)
-	}
-
-	log.Printf("[%s - Payment Processor VerifyInvoice]: Current Status: %s\tValue: %d\t AmountPaid: %d", ID, invoice.State.String(), invoice.Value, invoice.AmtPaidSat)
-	return invoice, nil
-}
-
-// Register a client request handler with the PaymentProcessor
-func (p *PaymentProcessor) Register(id string, lightningChannel chan *LightningPayment) {
-	log.Printf("[%s - Payment Processor]: Registering client!", id)
-	s := &Subscriber{ID: id, Notifier: lightningChannel, Registered: true}
-
-	// Add subscriber to ID map
-	p.Notifiers[id] = s // NOTE: This is concurrent access to the Notifier map.
-}
-
-// StreamPaymentRequests RPC creates a unidirectional stream of Lightning Network
-// invoices from Server -> Client. A Verification go routine monitors successfull settlement
-// of payment requests and notifies the RandomByte streamer upon receipt of each payment.
-func (p *PaymentProcessor) StreamPaymentRequests(req *rpc.StreamPaymentRequest, updateStream rpc.Payments_StreamPaymentRequestsServer) error {
-	log.Printf("[%s - inside StreamPaymentRequests]: Streaming payment requests to client!", req.ClientID)
-	ctx := updateStream.Context()
-	invoiceChan := make(chan *lnrpc.Invoice) // Buffered channel
-	sub, ok := p.Notifiers[req.ClientID]
-	if !ok {
-		log.Printf("[%s - inside StreamPaymentRequests]: No notifier in map!", req.ClientID)
-	}
-
-	// Verify outstanding invoices. NOTE: We create an invoice and then send
-	// it to the client. We then need to periodically check that the invoice is paid.
-	var invoiceToVerify *lnrpc.Invoice
+	// Check with lnd to see if we have recieved payment for a given client asynchronously.
+	// NOTE: Each call to Register() adds data to the processing queue so this can only create
+	// as many go routines as there are subscribers to the Payment Processor.
 	go func() {
-		for {
-			select {
-			case invoiceToVerify = <-invoiceChan: // We have a new invoice to verify settlement
-			case <-time.After(lndPollInterval):
-				log.Printf("[%s - inside StreamPaymentRequests Verifier]: Verifying settlement of invoice ... %x", req.ClientID, invoiceToVerify.RHash[:6])
-				invoice, err := p.VerifyInvoice(&lnrpc.PaymentHash{RHash: invoiceToVerify.RHash}, req.ClientID)
-				if err != nil {
-					log.Printf("[%s - inside StreamPaymentRequests]: unable to verify invoice this go around: %v Trying again ...", req.ClientID, err)
-				}
-
-				if invoice.State == lnrpc.Invoice_SETTLED {
-					log.Printf("[%s - inside StreamPaymentRequests Verifier]: Invoice settled successfully at %v ! ", req.ClientID, time.Unix(invoice.SettleDate, 0))
-					invoiceChan <- invoice // Tell stream to send another payment request
-					sub.Notifier <- &LightningPayment{ID: string(invoice.RHash), Invoice: invoice, Received: time.Unix(invoice.SettleDate, 0)}
-				}
-			case <-ctx.Done():
-				log.Printf("[%s - inside StreamPaymentRequests]: Verification complete. Context cancelled!", req.ClientID)
-				return
-			}
+		for sub := range p.Pending {
+			// Sends subscribers that have finished processing to 'Completed' workload channel
+			go sub.Process(p.Complete)
 		}
 	}()
 
-	// Generate and send the first invoice
-	invoice, err := p.AddInvoice(125, req.ClientID)
-	if err != nil {
-		return fmt.Errorf("unable to add invoice: %v", err)
-	}
-	request := rpc.PaymentRequest{PaymentRequest: invoice.PaymentRequest}
-	_ = updateStream.Send(&request)
-	invoiceChan <- invoice
-
-	// Stream payment requests as they are paid or until told to stop
-	for {
-		select {
-		case <-invoiceChan: // Write to this channel ONLY when we recieve payment.
-			// This way we only generate and send a new invoice to the client after the previous settles
-			invoice, err := p.AddInvoice(125, req.ClientID)
-			if err != nil {
-				return fmt.Errorf("unable to add invoice: %v", err)
-			}
-			request := rpc.PaymentRequest{PaymentRequest: invoice.PaymentRequest}
-			err = updateStream.Send(&request)
-			if err != nil {
-				return fmt.Errorf("unable to send invoice to Bitstream client: %v", err)
-			}
-			invoiceChan <- invoice
-		case <-ctx.Done():
-			log.Printf("[%s - inside StreamPaymentRequests]: Closing stream. Context cancelled!", req.ClientID)
-			return nil
-			// case <-p.quit:
-			// 	log.Printf("[%s - inside StreamPaymentRequests]: Ending invoice stream!", req.ClientID)
-			// 	return nil
-		}
-
+	// Receive subscribers and return them to the queue of workload for next round of processing
+	for sub := range p.Complete {
+		go sub.Sleep(p.Pending)
 	}
 }
 
-// EnableLightning opens a gRPC connection to lightning network daemon backend
-// TODO: If this function is to be reused across client/server maybe make it take
-// the gRPC server port of lnd as a parameter
-func (p *PaymentProcessor) EnableLightning() error {
-	usr, err := user.Current()
-	if err != nil {
-		return fmt.Errorf("Cannot get current user: %v", err)
-	}
-	fmt.Println("The user home directory: " + usr.HomeDir)
-	tlsCertPath := path.Join(usr.HomeDir, "Library/Application Support/Lnd/tls.cert")
-	// macaroonPath := path.Join(usr.HomeDir, ".lnd/admin.macaroon")
+// Process fetches lightning payments from the Lightning Network backend (LND) asynchronously
+// and notifies the various client request handlers when payments have been received, sending
+// the subscriber to 'done' channel to prepare for next round of processing
+func (s *Subscriber) Process(done chan<- *Subscriber) {
+	defer log.Printf("[%s - processor go routine]: Shutting down", s.ID)
 
-	tlsCreds, err := credentials.NewClientTLSFromFile(tlsCertPath, "")
-	if err != nil {
-		return fmt.Errorf("Cannot get node tls credentials: %v", err)
+	if !s.Registered { // Remove the subscriber from processing
+		log.Printf("[%s - processor go routine]: Client is no longer registered", s.ID)
+		return
 	}
 
-	opts := []grpc.DialOption{
-		grpc.WithTransportCredentials(tlsCreds),
-		grpc.WithBlock(),
-		// grpc.WithPerRPCCredentials(macaroons.NewMacaroonCredential(mac)),
+	payments, _ := s.Fetch()
+	for _, payment := range payments {
+		select {
+		case s.Notifier <- payment: // If the client handler has shut down this will block until the timeout (below) removes the subscriber from rotation
+			log.Printf("[%s - processor go routine]: Sending payment to client handler!", s.ID)
+		case <-time.After(10 * time.Second): // Ensure go routine does not block awaiting channel write forever (Could this remove sub from rotation when we still want to poll?)
+			log.Printf("[%s - processor go routine]: Unable to send payment to client handler - blocked for 10s!", s.ID)
+			return
+		}
 	}
+	done <- s // Processing of this subscriber is complete - return to processing queue
+}
 
-	conn, err := grpc.Dial("localhost:10001", opts...)
-	if err != nil {
-		return fmt.Errorf("cannot dial lnd backend: %v", err)
-	}
+// Sleep sleeps for a specified interval before sending
+// the Subscriber back to the processing channel for continued polling.
+func (s *Subscriber) Sleep(done chan<- *Subscriber) {
+	log.Printf("[%s - Sleep]: Waiting pollInterval seconds before returning client to input queue", s.ID)
+	time.Sleep(pollInterval)
+	done <- s
+}
 
-	p.LightningClient = lnrpc.NewLightningClient(conn)
-	return nil
+// NOTE: Could even consider this a "Monitor" routine and continuously monitor lnd for payments (THIS MIGHT BE IMPORTANT - we may need to share by communicating)
+// NOTE: The Process() function above is currently plagued by the fact that writes to the handler channels are blocking. Figure out how to
+// unblock these writes non-block writes (tho this might risk not notifying the handler), a "Monitor", or maybe just removing the processor.
+
+// Register a client request handler with the PaymentProcessor
+func (p *PaymentProcessor) Register(id string, lightningChannel chan *LightningPayment) {
+	log.Println("[Payment Processor]: Registering client ID: ", id)
+	s := &Subscriber{ID: id, Notifier: lightningChannel, Registered: true}
+
+	// Send subscriber to Payment Processor queue
+	p.Pending <- s
 }
