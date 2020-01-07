@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+message PaymentRequest {
+    string paymentRequest = 1;
+}
+
+message StreamPaymentRequest {
+    string clientID = 1;
+}
+
+service Payments {
+    /**
+    A uni-directional stream of Lightning Network 
+    payment requests from the server to the client .
+    */
+    rpc StreamPaymentRequests (StreamPaymentRequest) returns (stream PaymentRequest);
+}
