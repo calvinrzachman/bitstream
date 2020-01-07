@@ -1,2 +1,2 @@
 # bitstream
-a Lightning Network enabled streamer
+a simple Lightning Network enabled streamer
