@@ -80,6 +80,12 @@ import (
 
 	Learn about Spontaneous payments
 
+	Create an API with micropaywalled resources
+		- Server returns 402 Payment Required along with half baked macaroon and signed invoice
+		- Client pays to invoice and finishes macaroon bake
+		- Client reissues request and now has (revokable) access to resource
+	LSAT (Lightning Service Authentication Token)
+
 	IMPORTANT: After integrating Lightning Network functionality the server will no longer run
 	on computers without the proper LND setup. Either containerize/script LN Dev setup so that
 	Bitstream can run as a standalone or enable the server to plugin to nodes running on machines
