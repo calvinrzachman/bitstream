@@ -4,19 +4,20 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"net"
 	"os"
-	"os/user"
-	"path"
 	"time"
 
 	"projects/bitstream/rpc"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/macaroons"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"gopkg.in/macaroon.v2"
 )
 
 // Bitstream Client
@@ -155,23 +156,28 @@ func (bitstream *BitstreamClient) streamPayment(conn *grpc.ClientConn) {
 
 // EnableLightning opens a gRPC connection to lightning network daemon backend
 func EnableLightning() (lnrpc.LightningClient, error) {
-	usr, err := user.Current()
-	if err != nil {
-		return nil, fmt.Errorf("Cannot get current user: %v", err)
-	}
-	// fmt.Println("The user home directory: " + usr.HomeDir)
-	tlsCertPath := path.Join(usr.HomeDir, "Library/Application Support/Lnd/tls.cert")
-	// macaroonPath := path.Join(usr.HomeDir, ".lnd/admin.macaroon")
+	tlsCertPath := "../config/client/lnd/tls.cert"
+	macaroonPath := "../config/client/macaroons/admin.macaroon"
 
 	tlsCreds, err := credentials.NewClientTLSFromFile(tlsCertPath, "")
 	if err != nil {
 		return nil, fmt.Errorf("Cannot get node tls credentials: %v", err)
 	}
 
+	macaroonBytes, err := ioutil.ReadFile(macaroonPath)
+	if err != nil {
+		return nil, fmt.Errorf("Cannot read macaroon file: %v", err)
+	}
+
+	mac := &macaroon.Macaroon{}
+	if err = mac.UnmarshalBinary(macaroonBytes); err != nil {
+		return nil, fmt.Errorf("Cannot unmarshal macaroon: %v", err)
+	}
+
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(tlsCreds),
 		grpc.WithBlock(),
-		// grpc.WithPerRPCCredentials(macaroons.NewMacaroonCredential(mac)),
+		grpc.WithPerRPCCredentials(macaroons.NewMacaroonCredential(mac)),
 	}
 
 	conn, err := grpc.Dial("localhost:10003", opts...)
