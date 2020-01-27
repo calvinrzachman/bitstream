@@ -4,16 +4,17 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"log"
 	"math/rand"
 	"net"
-	"os/user"
-	"path"
 	"time"
 
 	"projects/bitstream/rpc"
 
 	"github.com/lightningnetwork/lnd/lnrpc"
+	"github.com/lightningnetwork/lnd/macaroons"
+	"gopkg.in/macaroon.v2"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
@@ -22,7 +23,6 @@ import (
 /*
 	For notes on streaming with the HTTP protocol see: https://stackoverflow.com/questions/48267616/why-is-golang-http-responsewriter-execution-being-delayed
 	Without the help from the article above we would likely need to use the net package directly to continuously send data over a TCP connection (TRY THIS!)
-
 
 	TODO:
 	- Create a client which opens connection to the random server and streams data.
@@ -87,6 +87,9 @@ import (
 
 	IMPORTANT: Look into differences between SendPayment and SendPaymentSync RPC
 
+	NOTE: RouterRPC TrackPayment RPC seems built for precisely this purpose. Use to verify payment settlement
+	inside of StreamPayment
+
 	ALTERNATIVE METHOD: From main create and run go BitstreamServer() and treat this as
 	new main go routine for each client connection, inside which we run go streamRandomBytes and stream
 	payment requests. This might simplify the code.
@@ -109,13 +112,15 @@ var (
 	payments PaymentProcessor
 )
 
+const bitstreamRPCPort = "10009"
+
 func init() {
 	// Initialize the Payment Processor
 	payments = PaymentProcessor{
 		Notifiers: map[string]*Subscriber{},
 	}
 
-	err := payments.EnableLightning()
+	err := payments.EnableLightning(bitstreamRPCPort)
 	if err != nil {
 		log.Fatalf("[PaymentProcessor init]: failed to setup payment processor - %v", err)
 	}
@@ -397,27 +402,33 @@ func (p *PaymentProcessor) StreamPaymentRequests(req *rpc.StreamPaymentRequest, 
 // EnableLightning opens a gRPC connection to lightning network daemon backend
 // TODO: If this function is to be reused across client/server maybe make it take
 // the gRPC server port of lnd as a parameter
-func (p *PaymentProcessor) EnableLightning() error {
-	usr, err := user.Current()
-	if err != nil {
-		return fmt.Errorf("Cannot get current user: %v", err)
-	}
-	fmt.Println("The user home directory: " + usr.HomeDir)
-	tlsCertPath := path.Join(usr.HomeDir, "Library/Application Support/Lnd/tls.cert")
-	// macaroonPath := path.Join(usr.HomeDir, ".lnd/admin.macaroon")
+func (p *PaymentProcessor) EnableLightning(rpcPort string) error {
+
+	tlsCertPath := "./config/server/lnd/tls.cert"
+	macaroonPath := "./config/server/macaroons/admin.macaroon"
 
 	tlsCreds, err := credentials.NewClientTLSFromFile(tlsCertPath, "")
 	if err != nil {
 		return fmt.Errorf("Cannot get node tls credentials: %v", err)
 	}
 
+	macaroonBytes, err := ioutil.ReadFile(macaroonPath)
+	if err != nil {
+		return fmt.Errorf("Cannot read macaroon file: %v", err)
+	}
+
+	mac := &macaroon.Macaroon{}
+	if err = mac.UnmarshalBinary(macaroonBytes); err != nil {
+		return fmt.Errorf("Cannot unmarshal macaroon: %v", err)
+	}
+
 	opts := []grpc.DialOption{
 		grpc.WithTransportCredentials(tlsCreds),
 		grpc.WithBlock(),
-		// grpc.WithPerRPCCredentials(macaroons.NewMacaroonCredential(mac)),
+		grpc.WithPerRPCCredentials(macaroons.NewMacaroonCredential(mac)),
 	}
 
-	conn, err := grpc.Dial("localhost:10001", opts...)
+	conn, err := grpc.Dial("localhost:"+rpcPort, opts...)
 	if err != nil {
 		return fmt.Errorf("cannot dial lnd backend: %v", err)
 	}
