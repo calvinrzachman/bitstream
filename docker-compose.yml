@@ -4,7 +4,7 @@ services:
   # btccli. The environment variables default values determined on stage of
   # container start within starting script.
   bitstream-btcd:
-      image: btcd
+      image: czachman/btcd
       container_name: bitstream-btcd
       volumes:
         - shared:/rpc
@@ -18,7 +18,7 @@ services:
       entrypoint: ["./start-btcd.sh"]
   
   bitstream-lnd:
-      image: lnd
+      image: czachman/lnd
       container_name: bitstream-lnd
       ports:
         - "10009:10009"
@@ -37,7 +37,7 @@ services:
       links:
         - "bitstream-btcd:blockchain"
   bitstream-client:
-      image: lnd
+      image: czachman/lnd
       container_name: bitstream-client
       ports:
         - "10003:10003"
