@@ -1,5 +1,14 @@
 # bitstream
 a simple Lightning Network enabled bit(coin) streamer
 
-## Lightning Network Development Environment
-Instructions to setup a 3 node Lightning Network simulation network [here](https://dev.lightning.community/tutorial/01-lncli/index.html)
+## Run locally
+
+Setup a containerized lightning network development environment and deploy the Bitstream server with:
+    
+    make bitstream
+
+Stream data from the server in exchange for lightning payments by running (in a separate window):
+    
+    make stream
+  
+ NOTE: The Lightning Network containers mount files to the workspace on your computer. Cleanup the workspace with `make clean` when finished. This will clear out Docker volumes and ensure that `make bitstream` will continue to function.
